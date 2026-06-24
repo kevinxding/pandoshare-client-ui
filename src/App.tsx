@@ -137,8 +137,19 @@ type ChatMessage = {
   role: 'user' | 'assistant'
   text: string
   time: string
+  attachments?: MessageAttachment[]
   activities?: ActivityPart[]
   timelineParts?: AssistantTimelinePart[]
+  streaming?: boolean
+}
+
+type MessageAttachment = {
+  id: string
+  name: string
+  size: number
+  mimeType: string
+  previewUrl?: string
+  path?: string
 }
 
 type ActivityKind = 'turn' | 'context' | 'model' | 'tool' | 'approval' | 'gui' | 'result' | 'error'
@@ -184,6 +195,17 @@ type ComposerSendPayload = {
   approvalMode: string
   modelId?: string
   goalId?: string
+  attachments?: MessageAttachment[]
+}
+
+type ContextUsage = {
+  usedTokens?: number
+  totalTokens?: number
+  percentUsed?: number
+  remainingPercent?: number
+  estimated: boolean
+  source: 'token_budget' | 'model_usage' | 'char_estimate'
+  updatedAtMs?: number
 }
 
 type AttachedGoal = {
@@ -427,6 +449,105 @@ const takeSmoothStreamChunk = (queue: string, completed: boolean) => {
     chunk: chars.slice(0, size).join(''),
     rest: chars.slice(size).join(''),
     delayMs: completed || length > 80 ? 8 : 22,
+  }
+}
+
+const CODEX_CONTEXT_BASELINE_TOKENS = 12_000
+const DEFAULT_CONTEXT_CHARS_PER_TOKEN = 4
+
+const clampPercent = (value: number) => Math.max(0, Math.min(100, Math.round(value)))
+
+const codexContextPercentUsed = (usedTokens: number | undefined, totalTokens: number | undefined) => {
+  if (usedTokens === undefined || totalTokens === undefined || totalTokens <= 0) {
+    return undefined
+  }
+
+  if (totalTokens <= CODEX_CONTEXT_BASELINE_TOKENS) {
+    return clampPercent((usedTokens / totalTokens) * 100)
+  }
+
+  const effectiveWindow = totalTokens - CODEX_CONTEXT_BASELINE_TOKENS
+  const effectiveUsed = Math.max(0, usedTokens - CODEX_CONTEXT_BASELINE_TOKENS)
+
+  return clampPercent((effectiveUsed / effectiveWindow) * 100)
+}
+
+const createContextUsage = (input: {
+  usedTokens?: number
+  totalTokens?: number
+  estimated: boolean
+  source: ContextUsage['source']
+  updatedAtMs?: number
+}): ContextUsage | undefined => {
+  const usedTokens = input.usedTokens !== undefined ? Math.max(0, Math.round(input.usedTokens)) : undefined
+  const totalTokens = input.totalTokens !== undefined ? Math.max(1, Math.round(input.totalTokens)) : undefined
+
+  if (usedTokens === undefined && totalTokens === undefined) {
+    return undefined
+  }
+
+  const percentUsed = codexContextPercentUsed(usedTokens, totalTokens)
+
+  return {
+    usedTokens,
+    totalTokens,
+    percentUsed,
+    remainingPercent: percentUsed !== undefined ? 100 - percentUsed : undefined,
+    estimated: input.estimated,
+    source: input.source,
+    updatedAtMs: input.updatedAtMs,
+  }
+}
+
+const formatTokenAmount = (tokens: number | undefined) => {
+  if (tokens === undefined) return '--'
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 10_000 ? 0 : 1)}K`
+
+  return String(tokens)
+}
+
+const describeContextUsage = (usage: ContextUsage | undefined) => {
+  if (!usage) {
+    return '上下文占用等待后端事件'
+  }
+
+  const prefix = usage.estimated ? '估算' : '实际'
+  const used = formatTokenAmount(usage.usedTokens)
+
+  if (usage.percentUsed !== undefined && usage.remainingPercent !== undefined && usage.totalTokens !== undefined) {
+    return `${prefix}剩余${usage.remainingPercent}%，已用${used}上下文，共${formatTokenAmount(usage.totalTokens)}`
+  }
+
+  if (usage.usedTokens !== undefined) {
+    return `${prefix}已用${used}上下文，模型窗口未知`
+  }
+
+  return '上下文占用等待后端事件'
+}
+
+const createAttachmentId = () => `attachment_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+const isImageAttachment = (attachment: MessageAttachment) => attachment.mimeType.startsWith('image/') && Boolean(attachment.previewUrl)
+
+const formatAttachmentSize = (size: number) => {
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(size >= 10 * 1024 * 1024 ? 0 : 1)} MB`
+  if (size >= 1024) return `${Math.round(size / 1024)} KB`
+
+  return `${size} B`
+}
+
+const fileToMessageAttachment = (file: File): MessageAttachment => {
+  const fileWithPath = file as File & { webkitRelativePath?: string }
+  const path = fileWithPath.webkitRelativePath || file.name
+
+  return {
+    id: createAttachmentId(),
+    name: file.name,
+    path,
+    size: file.size,
+    mimeType: file.type || 'application/octet-stream',
+    previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
   }
 }
 const getPinnedId = (kind: PinnedKind, sourceName: string) => `${kind}:${sourceName}`
@@ -1880,6 +2001,98 @@ const activityDetail = (event: AgentRunEvent, keys: string[]) => {
   return details.length > 0 ? details.join('\n') : undefined
 }
 
+const usageTotalTokens = (usage: Record<string, unknown> | undefined) => {
+  const directTotal =
+    agentEventNumber(usage, 'total_tokens') ??
+    agentEventNumber(usage, 'totalTokens') ??
+    agentEventNumber(usage, 'total') ??
+    agentEventNumber(usage, 'total_token_count')
+
+  if (directTotal !== undefined) {
+    return directTotal
+  }
+
+  const inputTokens =
+    agentEventNumber(usage, 'input_tokens') ??
+    agentEventNumber(usage, 'inputTokens') ??
+    agentEventNumber(usage, 'prompt_tokens') ??
+    agentEventNumber(usage, 'promptTokens')
+  const outputTokens =
+    agentEventNumber(usage, 'output_tokens') ??
+    agentEventNumber(usage, 'outputTokens') ??
+    agentEventNumber(usage, 'completion_tokens') ??
+    agentEventNumber(usage, 'completionTokens')
+
+  return inputTokens !== undefined || outputTokens !== undefined ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined
+}
+
+const usageContextWindowTokens = (usage: Record<string, unknown> | undefined) =>
+  agentEventNumber(usage, 'contextWindowTokens') ??
+  agentEventNumber(usage, 'context_window_tokens') ??
+  agentEventNumber(usage, 'model_context_window')
+
+const extractContextUsageFromEvent = (
+  event: AgentRunEvent,
+  currentUsage: ContextUsage | undefined,
+): ContextUsage | undefined => {
+  const tokenBudget = agentEventRecord(event, 'tokenBudget')
+  const createdAtMs = activityTime(event)
+
+  if (tokenBudget && agentEventBoolean(tokenBudget, 'enabled') !== false) {
+    const contextWindowTokens = agentEventNumber(tokenBudget, 'contextWindowTokens') ?? currentUsage?.totalTokens
+    const maxInputTokens = agentEventNumber(tokenBudget, 'maxInputTokens')
+    const reserveOutputTokens = agentEventNumber(tokenBudget, 'reserveOutputTokens')
+    const estimatedTokensLeft = agentEventNumber(tokenBudget, 'estimatedTokensLeft')
+    const estimatedInputTokens =
+      agentEventNumber(tokenBudget, 'estimatedInputTokens') ??
+      (maxInputTokens !== undefined && estimatedTokensLeft !== undefined ? maxInputTokens - estimatedTokensLeft : undefined)
+    const totalTokens =
+      contextWindowTokens ??
+      (maxInputTokens !== undefined && reserveOutputTokens !== undefined ? maxInputTokens + reserveOutputTokens : undefined)
+
+    return createContextUsage({
+      usedTokens: estimatedInputTokens,
+      totalTokens,
+      estimated: true,
+      source: 'token_budget',
+      updatedAtMs: createdAtMs,
+    })
+  }
+
+  const usage = agentEventRecord(event, 'usage')
+  const totalUsageTokens = usageTotalTokens(usage)
+
+  if (totalUsageTokens !== undefined) {
+    return createContextUsage({
+      usedTokens: totalUsageTokens,
+      totalTokens: usageContextWindowTokens(usage) ?? currentUsage?.totalTokens,
+      estimated: false,
+      source: 'model_usage',
+      updatedAtMs: createdAtMs,
+    })
+  }
+
+  if (getAgentRunEventType(event) === 'context_built') {
+    const estimatedChars = agentEventNumber(event, 'estimatedChars')
+    const maxContextChars = agentEventNumber(event, 'maxContextChars')
+
+    if (estimatedChars !== undefined || maxContextChars !== undefined) {
+      return createContextUsage({
+        usedTokens: estimatedChars !== undefined ? Math.ceil(estimatedChars / DEFAULT_CONTEXT_CHARS_PER_TOKEN) : undefined,
+        totalTokens: maxContextChars !== undefined ? Math.ceil(maxContextChars / DEFAULT_CONTEXT_CHARS_PER_TOKEN) : currentUsage?.totalTokens,
+        estimated: true,
+        source: 'char_estimate',
+        updatedAtMs: createdAtMs,
+      })
+    }
+  }
+
+  return undefined
+}
+
+const deriveContextUsageFromEvents = (events: AgentRunEvent[] | undefined) =>
+  (events ?? []).reduce<ContextUsage | undefined>((usage, event) => extractContextUsageFromEvent(event, usage) ?? usage, undefined)
+
 const compactActivityPreview = (value: string | undefined, maxChars = 180) => {
   if (!value) return undefined
   const compact = value.replace(/\s+/g, ' ').trim()
@@ -2438,6 +2651,57 @@ function AssistantMarkdown({ text }: { text: string }) {
   )
 }
 
+function MessageAttachmentGrid({
+  attachments,
+  compact = false,
+  onRemove,
+}: {
+  attachments?: MessageAttachment[]
+  compact?: boolean
+  onRemove?: (attachmentId: string) => void
+}) {
+  if (!attachments?.length) {
+    return null
+  }
+
+  return (
+    <div className={`message-attachments ${compact ? 'compact' : ''}`} aria-label="附件">
+      {attachments.map((attachment) => {
+        const image = isImageAttachment(attachment)
+        const title = attachment.path && attachment.path !== attachment.name ? attachment.path : attachment.name
+
+        return (
+          <div className={`message-attachment-card ${image ? 'image' : 'file'}`} key={attachment.id} title={title}>
+            {image ? (
+              <a href={attachment.previewUrl} target="_blank" rel="noreferrer" aria-label={`打开 ${attachment.name}`}>
+                <img className="message-attachment-thumb" src={attachment.previewUrl} alt={attachment.name} />
+              </a>
+            ) : (
+              <div className="message-attachment-file-icon" aria-hidden="true">
+                <Files size={17} />
+              </div>
+            )}
+            <div className="message-attachment-meta">
+              <span className="message-attachment-name">{attachment.name}</span>
+              <span className="message-attachment-size">{formatAttachmentSize(attachment.size)}</span>
+            </div>
+            {onRemove ? (
+              <button
+                className="message-attachment-remove"
+                type="button"
+                aria-label={`移除 ${attachment.name}`}
+                onClick={() => onRemove(attachment.id)}
+              >
+                <X size={12} />
+              </button>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 const activityStatusLabel = (status: ActivityStatus) => {
   if (status === 'waiting_approval') return 'Waiting'
   if (status === 'approved') return 'Approved'
@@ -2641,23 +2905,36 @@ function ChatTranscript({ messages }: { messages: ChatMessage[] }) {
     }, 1200)
   }
 
+  const lastAssistantMessageId = [...messages].reverse().find((message) => message.role === 'assistant')?.id
+
   return (
-    <div className="message-stack chat-transcript" aria-label="聊天内容" ref={transcriptRef}>
+    <div className="message-stack chat-transcript" aria-label="chat content" ref={transcriptRef}>
       <div className="chat-stream">
-        {messages.map((message) =>
-          message.role === 'user' ? (
+        {messages.map((message) => {
+          if (message.role === 'user') {
+            return (
+              <motion.div
+                className="chat-row user-row"
+                key={message.id}
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.22 }}
+              >
+                <div className="user-bubble">
+                  {message.text ? <div>{message.text}</div> : null}
+                  <MessageAttachmentGrid attachments={message.attachments} />
+                </div>
+              </motion.div>
+            )
+          }
+
+          const complete = message.text !== assistantThinkingText && !message.streaming
+          const latest = complete && message.id === lastAssistantMessageId
+          const actionClass = complete ? (latest ? 'assistant-latest' : 'assistant-history') : 'assistant-generating'
+
+          return (
             <motion.div
-              className="chat-row user-row"
-              key={message.id}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.22 }}
-            >
-              <div className="user-bubble">{message.text}</div>
-            </motion.div>
-          ) : (
-            <motion.div
-              className="chat-row assistant-row"
+              className={`chat-row assistant-row ${actionClass}`}
               key={message.id}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -2665,25 +2942,27 @@ function ChatTranscript({ messages }: { messages: ChatMessage[] }) {
             >
               <div className="assistant-reply">
                 <AssistantTimelineContent message={message} />
-                <div className="message-actions" aria-label="消息操作">
-                  <button
-                    className="message-action-button"
-                    type="button"
-                    aria-label={copiedMessageId === message.id ? "\u5df2\u590d\u5236\u56de\u590d" : "\u590d\u5236\u56de\u590d"}
-                    title={copiedMessageId === message.id ? "\u5df2\u590d\u5236" : "\u590d\u5236"}
-                    onClick={() => void copyMessage(message)}
-                  >
-                    {copiedMessageId === message.id ? <Check size={14} /> : <Copy size={14} />}
-                  </button>
-                  <button className="message-action-button" type="button" aria-label="展开回复">
-                    <Maximize2 size={13} />
-                  </button>
-                  <span className="message-time">{message.time}</span>
-                </div>
+                {complete ? (
+                  <div className="message-actions" aria-label="message actions">
+                    <button
+                      className="message-action-button"
+                      type="button"
+                      aria-label={copiedMessageId === message.id ? "\u5df2\u590d\u5236\u56de\u590d" : "\u590d\u5236\u56de\u590d"}
+                      title={copiedMessageId === message.id ? "\u5df2\u590d\u5236" : "\u590d\u5236"}
+                      onClick={() => void copyMessage(message)}
+                    >
+                      {copiedMessageId === message.id ? <Check size={14} /> : <Copy size={14} />}
+                    </button>
+                    <button className="message-action-button" type="button" aria-label="expand reply">
+                      <Maximize2 size={13} />
+                    </button>
+                    <span className="message-time">{message.time}</span>
+                  </div>
+                ) : null}
               </div>
             </motion.div>
-          ),
-        )}
+          )
+        })}
       </div>
     </div>
   )
@@ -2776,6 +3055,7 @@ function Composer({
   onToggleGoalPaused,
   onContinueGoal,
   onClearGoal,
+  contextUsage,
 }: {
   onSend: (payload: ComposerSendPayload) => void
   goal: AttachedGoal | null
@@ -2783,6 +3063,7 @@ function Composer({
   onToggleGoalPaused: () => Promise<void>
   onContinueGoal: () => Promise<void>
   onClearGoal: () => Promise<void>
+  contextUsage?: ContextUsage
 }) {
   const [attachOpen, setAttachOpen] = useState(false)
   const [approvalOpen, setApprovalOpen] = useState(false)
@@ -2795,6 +3076,7 @@ function Composer({
   const [availableModelGroups, setAvailableModelGroups] = useState<ModelGroup[]>(modelGroups)
   const [visibleModelKeys, setVisibleModelKeys] = useState<Set<string> | null>(null)
   const [message, setMessage] = useState('')
+  const [selectedAttachments, setSelectedAttachments] = useState<MessageAttachment[]>([])
   const [goalCaptureActive, setGoalCaptureActive] = useState(false)
   const [goalBusy, setGoalBusy] = useState(false)
   const [goalError, setGoalError] = useState<string | undefined>()
@@ -2803,13 +3085,11 @@ function Composer({
   const folderInputRef = useRef<HTMLInputElement | null>(null)
   const slashMenuState = goalCaptureActive ? null : getSlashMenuState(message)
   const goalVisible = goalCaptureActive || Boolean(goal)
-  const canSend = message.trim().length > 0
-  const contextUsedK = 30
-  const contextTotalK = 100
-  const contextUsedPercent = Math.round((contextUsedK / contextTotalK) * 100)
-  const contextRemainingPercent = 100 - contextUsedPercent
+  const canSend = goalCaptureActive ? message.trim().length > 0 : message.trim().length > 0 || selectedAttachments.length > 0
+  const contextUsedPercent = contextUsage?.percentUsed ?? 0
   const contextMeterTone = contextUsedPercent >= 90 ? 'full' : contextUsedPercent >= 70 ? 'warning' : 'normal'
   const contextMeterStyle = { '--context-progress': `${contextUsedPercent}%` } as CSSProperties
+  const contextMeterText = describeContextUsage(contextUsage)
   const visibleModelGroups = availableModelGroups
     .map((group) => ({
       ...group,
@@ -2905,8 +3185,26 @@ function Composer({
     folderInputRef.current?.click()
   }
 
-  const clearPickedFiles = (event: ChangeEvent<HTMLInputElement>) => {
+  const addPickedFiles = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? [])
+
+    if (files.length > 0) {
+      setSelectedAttachments((currentAttachments) => [...currentAttachments, ...files.map(fileToMessageAttachment)])
+    }
+
     event.currentTarget.value = ''
+    focusComposerInput()
+  }
+
+  const removeSelectedAttachment = (attachmentId: string) => {
+    setSelectedAttachments((currentAttachments) => {
+      const target = currentAttachments.find((attachment) => attachment.id === attachmentId)
+      if (target?.previewUrl) {
+        URL.revokeObjectURL(target.previewUrl)
+      }
+
+      return currentAttachments.filter((attachment) => attachment.id !== attachmentId)
+    })
   }
 
   const toggleVisibleModel = (provider: string, model: string) => {
@@ -2931,11 +3229,14 @@ function Composer({
   const submitMessage = async () => {
     const trimmedMessage = message.trim()
 
-    if (!trimmedMessage || goalBusy) {
+    if (goalBusy) {
       return
     }
 
     if (goalCaptureActive) {
+      if (!trimmedMessage) {
+        return
+      }
       setGoalBusy(true)
       setGoalError(undefined)
       const created = await onCreateGoal(trimmedMessage)
@@ -2951,18 +3252,26 @@ function Composer({
       return
     }
 
+    if (!trimmedMessage && selectedAttachments.length === 0) {
+      return
+    }
+
     if (isGoalSlashCommand(trimmedMessage)) {
       startGoalCapture('')
       return
     }
 
+    const outboundAttachments = selectedAttachments
+
     onSend({
-      message: trimmedMessage,
+      message: trimmedMessage || '已添加附件',
       approvalMode,
       modelId: selectedModel === defaultModelLabel ? undefined : selectedModel,
       goalId: goal && !goal.paused ? goal.goalId : undefined,
+      attachments: outboundAttachments,
     })
     setMessage('')
+    setSelectedAttachments([])
   }
 
   return (
@@ -3015,7 +3324,7 @@ function Composer({
         hidden
         aria-hidden="true"
         tabIndex={-1}
-        onChange={clearPickedFiles}
+        onChange={addPickedFiles}
       />
       <input
         ref={(element) => {
@@ -3030,10 +3339,11 @@ function Composer({
         hidden
         aria-hidden="true"
         tabIndex={-1}
-        onChange={clearPickedFiles}
+        onChange={addPickedFiles}
       />
 
-      <div className="composer">
+      <div className={`composer ${selectedAttachments.length > 0 ? 'has-attachments' : ''}`}>
+        <MessageAttachmentGrid attachments={selectedAttachments} compact onRemove={removeSelectedAttachment} />
         <textarea
           ref={composerInputRef}
           className="composer-input"
@@ -3169,12 +3479,12 @@ function Composer({
             className={`context-meter ${contextMeterTone}`}
             style={contextMeterStyle}
             tabIndex={0}
-            aria-label={`\u4e0a\u4e0b\u6587\u72b6\u6001\uff0c\u5df2\u7528${contextUsedPercent}%`}
+            aria-label={contextUsage?.percentUsed !== undefined ? `上下文状态，已用${contextUsedPercent}%` : '上下文状态，等待后端事件'}
           >
             <span className="context-meter-ring" aria-hidden="true">
               <span className="context-meter-core" />
             </span>
-            <span className="context-tooltip">{`\u5269\u4f59${contextRemainingPercent}%\uff0c\u5df2\u7528${contextUsedK}K\u4e0a\u4e0b\u6587\uff0c\u5171${contextTotalK}K`}</span>
+            <span className="context-tooltip">{contextMeterText}</span>
           </div>
 
           <button className="mic-button" type="button" aria-label="语音输入">
@@ -3195,11 +3505,13 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
   const [conversationIdsByChat, setConversationIdsByChat] = useState<Record<string, string>>({})
   const [attachedGoal, setAttachedGoal] = useState<AttachedGoal | null>(null)
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, PendingApprovalItem>>({})
+  const [contextUsageByChat, setContextUsageByChat] = useState<Record<string, ContextUsage>>({})
   const [chatMenuOpen, setChatMenuOpen] = useState(false)
   const smoothWritersRef = useRef<Map<number, SmoothWriterState>>(new Map())
   const activitySequenceRef = useRef(0)
   const activeConversationId = conversationIdsByChat[activeChat.id] ?? activeChat.conversationId
   const messages = messagesByChat[activeChat.id] ?? initialMessages
+  const contextUsage = contextUsageByChat[activeChat.id]
   const visiblePendingApprovals = Object.values(pendingApprovals).filter(
     (approval) => !approval.threadId || !activeConversationId || approval.threadId === activeConversationId,
   )
@@ -3230,6 +3542,14 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
           setMessagesByChat((currentMessagesByChat) => ({
             ...currentMessagesByChat,
             [activeChat.id]: attachActivityGroupsToMessages(loadedMessages, loadedEvents),
+          }))
+        }
+
+        const loadedContextUsage = deriveContextUsageFromEvents(loadedEvents)
+        if (active && loadedContextUsage) {
+          setContextUsageByChat((currentUsageByChat) => ({
+            ...currentUsageByChat,
+            [activeChat.id]: loadedContextUsage,
           }))
         }
       })
@@ -3300,6 +3620,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
           ...message,
           text: append ? (message.text === assistantThinkingText ? '' : message.text) + nextText : nextText,
           timelineParts,
+          streaming: append ? message.streaming : false,
         }
       }),
     }))
@@ -3346,6 +3667,15 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
     writer.timer = window.setTimeout(() => drainSmoothWriter(assistantId), delayMs)
   }
 
+  const setAssistantStreaming = (assistantId: number, streaming: boolean) => {
+    setMessagesByChat((currentMessagesByChat) => ({
+      ...currentMessagesByChat,
+      [activeChat.id]: (currentMessagesByChat[activeChat.id] ?? initialMessages).map((message) =>
+        message.id === assistantId ? { ...message, streaming } : message,
+      ),
+    }))
+  }
+
   function drainSmoothWriter(assistantId: number) {
     const writer = smoothWritersRef.current.get(assistantId)
     if (!writer) return
@@ -3354,6 +3684,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
     if (!writer.queue) {
       if (writer.completed) {
         flushPendingAssistantActivities(assistantId)
+        setAssistantStreaming(assistantId, false)
         smoothWritersRef.current.delete(assistantId)
       }
       return
@@ -3370,6 +3701,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
 
     if (writer.completed) {
       flushPendingAssistantActivities(assistantId)
+      setAssistantStreaming(assistantId, false)
       smoothWritersRef.current.delete(assistantId)
     }
   }
@@ -3384,7 +3716,10 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
 
   const completeSmoothAssistantText = (assistantId: number) => {
     const writer = smoothWritersRef.current.get(assistantId)
-    if (!writer) return
+    if (!writer) {
+      setAssistantStreaming(assistantId, false)
+      return
+    }
 
     writer.completed = true
     if (writer.timer !== null) {
@@ -3461,6 +3796,12 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
     if (assistantId !== undefined) {
       updateAssistantActivity(assistantId, event)
     }
+
+    setContextUsageByChat((currentUsageByChat) => {
+      const nextUsage = extractContextUsageFromEvent(event, currentUsageByChat[activeChat.id])
+
+      return nextUsage ? { ...currentUsageByChat, [activeChat.id]: nextUsage } : currentUsageByChat
+    })
 
     const type = getAgentRunEventType(event)
 
@@ -3610,7 +3951,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
         [activeChat.id]: [
           ...currentMessages,
           { id: userId, role: 'user', text: userText, time },
-          { id: assistantId, role: 'assistant', text: assistantThinkingText, time, activities: [], timelineParts: [] },
+          { id: assistantId, role: 'assistant', text: assistantThinkingText, time, activities: [], timelineParts: [], streaming: true },
         ],
       }
     })
@@ -3686,8 +4027,8 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
         ...currentMessagesByChat,
         [activeChat.id]: [
           ...currentMessages,
-          { id: userId, role: 'user', text: payload.message, time },
-          { id: assistantId, role: 'assistant', text: assistantThinkingText, time, activities: [], timelineParts: [] },
+          { id: userId, role: 'user', text: payload.message, time, attachments: payload.attachments },
+          { id: assistantId, role: 'assistant', text: assistantThinkingText, time, activities: [], timelineParts: [], streaming: true },
         ],
       }
     })
@@ -3833,6 +4174,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
           onToggleGoalPaused={handleToggleGoalPaused}
           onContinueGoal={handleContinueGoal}
           onClearGoal={handleClearGoal}
+          contextUsage={contextUsage}
         />
       </section>
     </main>

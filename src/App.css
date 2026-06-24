@@ -1215,6 +1215,134 @@ button {
   overflow-wrap: anywhere;
 }
 
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.message-attachments.compact {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: 11px;
+  z-index: 2;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.message-attachments.compact::-webkit-scrollbar {
+  height: 5px;
+}
+
+.message-attachments.compact::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(122, 131, 144, 0.2);
+}
+
+.message-attachment-card {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  max-width: 240px;
+  padding: 7px 9px;
+  border: 1px solid rgba(210, 216, 226, 0.82);
+  border-radius: 12px;
+  color: #4b5563;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 1px 2px rgba(27, 33, 43, 0.04);
+  overflow: hidden;
+}
+
+.message-attachment-card.image {
+  grid-template-columns: 58px minmax(0, 1fr);
+  min-width: min(220px, 100%);
+  padding: 6px;
+}
+
+.message-attachments.compact .message-attachment-card {
+  flex: 0 0 auto;
+  max-width: 230px;
+  background: rgba(247, 249, 252, 0.94);
+}
+
+.message-attachment-card a {
+  min-width: 0;
+  display: block;
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.message-attachment-thumb {
+  width: 58px;
+  height: 48px;
+  display: block;
+  object-fit: cover;
+  background: #edf1f6;
+}
+
+.message-attachment-file-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: #667085;
+  background: rgba(236, 240, 246, 0.9);
+}
+
+.message-attachment-meta {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.message-attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #303844;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-attachment-size {
+  color: #8b95a4;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.message-attachment-remove {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  width: 19px;
+  height: 19px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  color: #606a78;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 1px 4px rgba(25, 31, 40, 0.14);
+  cursor: pointer;
+}
+
+.message-attachment-remove:hover,
+.message-attachment-remove:focus-visible {
+  outline: 0;
+  color: #111827;
+  background: #ffffff;
+}
+
 .message-actions {
   height: 25px;
   display: flex;
@@ -1222,6 +1350,21 @@ button {
   gap: 6px;
   margin-top: 6px;
   color: #99a1ad;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.assistant-row.assistant-latest .message-actions,
+.assistant-row.assistant-history:hover .message-actions,
+.assistant-row.assistant-history:focus-within .message-actions {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.assistant-row.assistant-generating .message-actions {
+  display: none;
 }
 
 .message-action-button {
@@ -1334,6 +1477,15 @@ button {
   font-size: 14px;
   line-height: 1.5;
   resize: none;
+}
+
+.composer.has-attachments {
+  min-height: 142px;
+}
+
+.composer.has-attachments .composer-input {
+  min-height: 126px;
+  padding-top: 80px;
 }
 
 

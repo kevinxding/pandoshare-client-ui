@@ -185,29 +185,54 @@ const unwrapOkRecord = (value: unknown): AnyRecord | undefined => {
   return isRecord(data) ? data : undefined
 }
 
-async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T | undefined> {
-  try {
-    const response = await fetch(url, {
-      ...init,
-      headers: {
-        Accept: 'application/json',
-        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-        ...init?.headers,
-      },
-    })
+const fallbackApiBase = (() => {
+  const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env
+  const value = env?.VITE_PANDOSHARE_API_FALLBACK?.trim()
 
-    if (!response.ok) {
-      return undefined
-    }
+  return value && value !== window.location.origin ? value.replace(/\/+$/, '') : undefined
+})()
 
-    if (response.status === 204) {
-      return undefined
-    }
-
-    return (await response.json()) as T
-  } catch {
-    return undefined
+function apiRequestUrls(url: string) {
+  if (/^https?:\/\//i.test(url)) {
+    return [url]
   }
+
+  const urls = [url]
+
+  if (fallbackApiBase && url.startsWith('/api/')) {
+    urls.push(`${fallbackApiBase}${url}`)
+  }
+
+  return urls
+}
+
+async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T | undefined> {
+  for (const requestUrl of apiRequestUrls(url)) {
+    try {
+      const response = await fetch(requestUrl, {
+        ...init,
+        headers: {
+          Accept: 'application/json',
+          ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+          ...init?.headers,
+        },
+      })
+
+      if (!response.ok) {
+        continue
+      }
+
+      if (response.status === 204) {
+        return undefined
+      }
+
+      return (await response.json()) as T
+    } catch {
+      continue
+    }
+  }
+
+  return undefined
 }
 
 const nowTime = () => {
@@ -249,6 +274,28 @@ const durationText = (value: unknown): string => {
   return `${(ms / 1000).toFixed(1)}s`
 }
 
+const stableUiMessageId = (value: Record<string, unknown>): number => {
+  const numeric = asNumber(value.id)
+
+  if (numeric !== undefined) {
+    return numeric
+  }
+
+  const createdAtMs = asNumber(value.createdAtMs)
+  const seed = asString(value.id) ?? `${asString(value.role) ?? 'message'}:${asString(value.content) ?? asString(value.text) ?? ''}:${createdAtMs ?? ''}`
+  let hash = 0
+
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) | 0
+  }
+
+  if (createdAtMs !== undefined) {
+    return createdAtMs + Math.abs(hash % 1000)
+  }
+
+  return Math.abs(hash) + 1_000_000
+}
+
 const normalizeMessage = (value: unknown): UiChatMessage | undefined => {
   if (!isRecord(value)) {
     return undefined
@@ -262,7 +309,7 @@ const normalizeMessage = (value: unknown): UiChatMessage | undefined => {
   }
 
   return {
-    id: asNumber(value.id) ?? Date.now(),
+    id: stableUiMessageId(value),
     role,
     text,
     time: asString(value.time) ?? formatDateTime(value.createdAtMs) ?? nowTime(),
@@ -669,7 +716,7 @@ function approvalRequestFields(approvalMode?: string) {
   const mode = approvalMode?.trim()
 
   switch (mode) {
-    case '替我审批':
+    case '鏇挎垜瀹℃壒':
     case 'auto_review':
     case 'auto-review':
     case 'auto-approve':
@@ -679,7 +726,7 @@ function approvalRequestFields(approvalMode?: string) {
         approvalsReviewer: 'auto_review',
         sandboxMode: 'workspace-write',
       }
-    case '完全访问权限':
+    case '瀹屽叏璁块棶鏉冮檺':
     case 'full_access':
     case 'full-access':
     case 'danger-full-access':
@@ -689,7 +736,7 @@ function approvalRequestFields(approvalMode?: string) {
         approvalsReviewer: 'user',
         sandboxMode: 'danger-full-access',
       }
-    case '请求批准':
+    case '璇锋眰鎵瑰噯':
     case 'request_approval':
     case 'request-approval':
     case 'ask-for-approval':
@@ -714,7 +761,9 @@ export function streamRun(
   },
 ) {
   try {
-    const source = new EventSource(`/api/events?threadId=${encodeURIComponent(threadId)}`)
+    const eventUrl = `${fallbackApiBase ?? ''}/api/events?threadId=${encodeURIComponent(threadId)}${runId ? `&runId=${encodeURIComponent(runId)}` : ''}`
+    const source = new EventSource(eventUrl)
+    const seenEventIds = new Set<string>()
 
     const closeDone = () => {
       handlers.onDone()
@@ -731,7 +780,7 @@ export function streamRun(
         return true
       }
 
-      const payloadRunId = asString(payload.sessionId) ?? asString(payload.runId)
+      const payloadRunId = asString(payload.runId)
 
       return !payloadRunId || payloadRunId === runId
     }
@@ -746,6 +795,15 @@ export function streamRun(
 
         if (!matchesRun(payload)) {
           return
+        }
+
+
+        const eventId = asString(payload.id)
+        if (eventId) {
+          if (seenEventIds.has(eventId)) {
+            return
+          }
+          seenEventIds.add(eventId)
         }
 
         const type = asString(payload.type) ?? asString(payload.event)
@@ -936,7 +994,7 @@ const normalizeHeartbeatRun = (value: unknown): UiHeartbeatHistoryRow | undefine
 }
 
 const normalizeHeartbeatException = (row: UiHeartbeatHistoryRow): UiHeartbeatException | undefined => {
-  if (!['failed', 'error', 'stuck', 'skipped', '失败', '卡住'].includes(row.status)) {
+  if (!['failed', 'error', 'stuck', 'skipped', '澶辫触', '鍗′綇'].includes(row.status)) {
     return undefined
   }
 
